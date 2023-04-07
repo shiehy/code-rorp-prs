@@ -1,0 +1,413 @@
+---
+title: "UKB PRS Analysis"
+date: "`r format(Sys.time(), '%d %B %Y')`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning=FALSE, message=FALSE, fig.show="hold")
+library(tidyverse)
+library(here)
+library(survival)
+library(survminer)
+library(ggthemes)
+library(gridExtra)
+library(knitr)
+library(gtsummary)
+library(webshot)
+library(survMisc)
+library(ggsci)
+library(rms)
+```
+*Version notes:*
+
+* Publication version
+
+## *ROR-P PRS*
+
+### Load and prep data
+
+```{r}
+datapath = "/Volumes/Shieh-share$/SNPTumor/data/processed/"
+load(paste0(datapath, "UKB_cleaned.RData"))
+load(paste0(datapath, "snpcoeff_rorp76.RData"))
+
+betas <- snpcoeff_rorp76
+
+# Subset UKB to malignant BC, filter by necessary covar/SNPs
+ukb_data <- ukb.noNA.combined_incident %>%
+  subset(behavior.1 == 3) %>%
+  dplyr::select(eid, breast_death, fu_time, breast_dxage_any, any_of(starts_with("PC")), any_of(rownames(betas))) %>%
+  relocate(starts_with("rs"), .after=last_col()) %>%
+  relocate(contains(":"), .after=last_col())
+
+wheresnps <- grepl('^rs', colnames(ukb_data))
+firstsnpcol <- min(which(wheresnps==T))
+
+# Set missing SNPs in UKB to 0
+totcol <- ncol(ukb_data)
+snps <- rownames(betas)
+inukb <- colnames(ukb_data[,firstsnpcol:totcol])
+miss.snps <- setdiff(snps,inukb)
+
+miss.snps.geno <- as.data.frame(matrix(data = 0, nrow = nrow(ukb_data), ncol = length(miss.snps)))
+colnames(miss.snps.geno) <- miss.snps
+ukb_data <- cbind(ukb_data, miss.snps.geno)
+
+```
+
+### Calculate PRS
+
+```{r}
+
+ukb_snps <- ukb_data %>% select(all_of(snps))
+weighted.score <- as.matrix(ukb_snps) %*% betas$coeff
+  
+ukb_results <- cbind(weighted.score, ukb_data[,c(1:(paste0(firstsnpcol-1)))])
+ukb_results <- rename(ukb_results, rorp_prs=weighted.score)
+
+print(paste0("Number of SNPs in UKB PRS: ", length(inukb)))
+```
+
+## **Data exploration**
+
+### FIG. S3A: Histogram of ROR-P PRS
+```{r, echo=FALSE, fig.align="center", out.width="50%", fig.show="hold"}
+
+prs_hist <- ggplot(ukb_results, aes(rorp_prs)) + 
+  geom_histogram(binwidth=1, color="black", fill="lightblue") + theme_minimal() +
+  ggtitle("UK Biobank") +
+  scale_x_continuous("ROR-P PRS", limits=c(-50,0), breaks=seq(-50,0,10)) +
+  theme(plot.title = element_text(hjust = 0.5, size=14, face="bold"), axis.title.x = element_text(size=12),
+                          axis.title.y = element_text(size=12))
+
+prs_hist
+
+ggsave(plot=prs_hist, filename=here("output/UKB_RORP-PRS_dist.png"), width = 8, height=4, bg = "white")
+
+ukb_results %>%
+  dplyr::summarize(mean_rorp_prs = mean(rorp_prs),
+            sd_rorp_prs = sd(rorp_prs))
+
+```
+
+
+## **Survival analysis**
+
+### Kaplan Meier analysis
+```{r}
+ukb_results <- ukb_results %>% 
+  mutate(prs.tert = ntile(rorp_prs, 3)) %>%
+  mutate(fu_yrs = fu_time/365)
+
+km <- with(ukb_results, Surv(fu_yrs, breast_death))
+km_pc_fit <- survfit(Surv(fu_yrs, breast_death)~prs.tert, data=ukb_results)
+
+```
+
+
+### Fig.6A: KM for tertiles of ROR-P PRS
+Note: Tertile 1 corresponds to lowest predicted RORP, Tertile 3 corresponds to highest predicted RORP
+``` {r, echo=FALSE, fig.align="center", out.width="75%"}
+
+ukb_rorpPRS <- ggsurvplot(km_pc_fit, data = ukb_results, 
+           pval=TRUE, pval.method=T, conf.int=F, title = "a",
+           ylim=c(0.80,1), xlim=c(0,10), break.time.by=2, xlab = "Time (years)",
+           pval.coord = c(8, 0.835), pval.method.coord = c(8, 0.85),
+           legend = c(0.15, 0.25), legend.labs=c("Bottom", "Middle", "Top"), legend.title="Tertiles of ROR-P PRS",
+           risk.table = T, risk.table.height = 0.3, tables.theme=theme_survminer(), risk.table.fontsize=4,
+           ggtheme=theme_classic(), palette=c("#482677FF", "#1F968BFF", "#FDE725FF"),
+           font.x = c(14), font.y = c(14),
+           font.tickslab = c(12))
+
+ukb_rorpPRS$plot <- ukb_rorpPRS$plot + theme(plot.title=element_text(hjust=-0.1, face="bold", size=18))
+
+grid.draw.ggsurvplot <- function(x){
+  survminer:::print.ggsurvplot(x, newpage = FALSE)
+}
+
+ggsave(here("output/Fig6a.eps"), plot=ukb_rorpPRS, dpi=600, width=10, height=7, units="in")
+ukb_rorpPRS
+survdiff(km ~ prs.tert, data = ukb_results)
+```
+### Normalize PRS for Cox models
+```{r}
+ukb_results <- ukb_results %>%
+  mutate(mean = mean(rorp_prs, na.rm=T),
+         sd = sd(rorp_prs, na.rm=T),
+         RORP_norm = (rorp_prs - mean)/sd) %>%
+  select(-c(mean, sd))
+
+```
+
+
+### Cox Model 1, ROR-P PRS + PCs
+```{r}
+
+cox.norm <- coxph(Surv(fu_time, breast_death) ~ RORP_norm + PC1+PC2+PC3+PC4+PC5+PC6+PC7+PC8+PC9+PC10, data=ukb_results)
+summary(cox.norm)
+
+```
+
+### Cox Model 2, ROR-P PRS + age, BMI, PCs
+```{r}
+
+# Repeat Cox but with normalized PRS
+cox.norm <- coxph(Surv(fu_time, breast_death) ~ RORP_norm + PC1+PC2+PC3+PC4+PC5+PC6+PC7+PC8+PC9+PC10 + breast_dxage_any, data=ukb_results)
+summary(cox.norm)
+
+```
+
+
+### **Calibration**
+
+### FIG. S4: calibration of ROR-P PRS
+```{r}
+f <- cph(Surv(fu_time, breast_death) ~ RORP_norm + PC1+PC2+PC3+PC4+PC5+PC6+PC7+PC8+PC9+PC10, 
+         data = ukb_results,
+         x=TRUE, y=TRUE, surv=TRUE, time.inc=365.25*5)
+
+val <- validate(f, B=10, u=365.25*5)
+
+D <- val[1, 5]
+cstat <- (0.5*D) + 0.5
+
+#or f <- psm(S ~ \dots)
+#pa <- 'polspline' %in% row.names(installed.packages())
+#if(pa) {
+  #cal <- calibrate(f, u=365.25*5, B=20)  # cmethod='hare'
+  #plot(cal)
+#}
+#cal
+
+cal <- calibrate(f, u=365.25*5, cmethod='KM', m=740, B=200)  # usually B=200 or 300
+cal
+calplot <- plot(cal, xlab = "Predicted 5-year survival", ylab = "Observed 5-year survival", 
+                xlim = c(0.90, 0.98), ylim = c(0.90, 0.98),
+                cuts = c(0.91, 0.92, 0.93, 0.94, 0.95, 0.96),
+                subtitles = T)
+
+
+cox.norm <- coxph(Surv(fu_time, breast_death) ~ RORP_norm + PC1+PC2+PC3+PC4+PC5+PC6+PC7+PC8+PC9+PC10, data=ukb_results)
+gof(cox.norm, G=10)
+```
+
+### Save calibration plot
+```{r, eval=FALSE}
+png("../output/ukb_calibration_plot.png", width = 6, height=6, units="in", res=600)
+calplot <- plot(cal, xlab = "Predicted 5-year survival", ylab = "Observed 5-year survival", 
+                xlim = c(0.90, 0.98), ylim = c(0.90, 0.98),
+                cuts = c(0.91, 0.92, 0.93, 0.94, 0.95, 0.96),
+                subtitles = F)
+dev.off()
+```
+
+
+
+## *PRS for ER-negative vs ER-positive disease*
+
+*This is a 193-SNP PRS:*
+
+* Started with 271 SNPs considered for inclusion in the RORP PRS
+  + 237 had retrievable summary stats for ER- and ER+ disease in BCAC
+  + 205 remained after LD pruning using cutoff of r2 = 0.2
+  + 193 were available in UK Biobank
+* Used ER-specific ORs from BCAC meta-analysis https://gwas.mrcieu.ac.uk/, datasets eu-a-1127 and eu-a-1128
+* Generated case-case betas by subtracting ER+ beta from ER- beta, then converted to OR
+* Oriented PRS input so that all ORs >= 1 and risk allele corresponds to the allele conferring greater ER- relative to ER+ risk
+
+### Load and prep ER negative PRS data
+
+```{r}
+
+# merge in ER-neg PRS
+prs_erneg <- read.table(paste0(datapath, "PRS_ukb_prs205.txt"), header=F)
+
+prs_erneg <- prs_erneg %>% 
+  rename(eid = V1, prs.erneg = V2, race = V3) %>%
+  select(-race) %>%
+  mutate_at(vars(eid), as.character)
+
+ukb_results <- ukb_results %>% inner_join(prs_erneg, by="eid")
+
+```
+
+## **Data exploration**
+
+### Histogram of ER-negative PRS
+```{r, echo=FALSE, fig.align="center", out.width="50%", fig.show="hold", eval=FALSE}
+ggplot(ukb_results, aes(log(prs.erneg))) + geom_histogram(binwidth=0.1, color="black", fill="lightblue") + theme_clean() +
+  ggtitle("Distribution of ER-negative PRS")
+```
+
+
+## **Survival analysis**
+
+### Kaplan-Meier analysis
+```{r}
+ukb_results <- ukb_results %>% 
+  mutate(prs.erneg.tert = ntile(prs.erneg, 3)) %>%
+  mutate(fu_yrs = fu_time/365)
+
+km <- with(ukb_results, Surv(fu_yrs, breast_death))
+km_pc_fit_erneg <- survfit(Surv(fu_yrs, breast_death)~prs.erneg.tert, data=ukb_results)
+
+```
+
+
+### FIG. 6C: KM for tertiles of ER- PRS 
+Note: Quartile 1 corresponds to lowest PRS, Quartile 4 corresponds to highest PRS
+```{r, echo=FALSE, fig.align="center", out.width="75%"}
+
+ukb_erPRS <- ggsurvplot(km_pc_fit_erneg, data = ukb_results, 
+           pval=TRUE, pval.method=T, conf.int=F, title="c",
+           ylim=c(0.80,1), xlim=c(0,10), break.time.by=2, xlab = "Time (years)",
+           pval.coord = c(8, 0.835), pval.method.coord = c(8, 0.85),
+           legend = c(0.15, 0.25), legend.labs=c("Bottom", "Middle", "Top"), legend.title=expression(Tertiles~of~PRS[ER*"-"*"/"*ER*"+"]),
+           risk.table = T, risk.table.height = 0.3, tables.theme=theme_survminer(), risk.table.fontsize=4,
+           ggtheme=theme_classic(), palette=c("#482677FF", "#1F968BFF", "#FDE725FF"),
+           font.x = c(14), font.y = c(14),
+           font.tickslab = c(12))
+
+ukb_erPRS$plot <- ukb_erPRS$plot + theme(plot.title=element_text(hjust=-0.1, face="bold", size=18))
+
+grid.draw.ggsurvplot <- function(x){
+  survminer:::print.ggsurvplot(x, newpage = FALSE)
+}
+
+ggsave(here("output/Fig6c.eps"), plot=ukb_erPRS, dpi=600, width=10, height=7, units="in")
+ukb_erPRS
+```
+
+
+### Normalize ER- PRS for Cox models
+```{r}
+ukb_results <- ukb_results %>%
+  mutate(mean = mean(prs.erneg, na.rm=T),
+         sd = sd(prs.erneg, na.rm=T),
+         prs.erneg_norm = (prs.erneg - mean)/sd) %>%
+  select(-c(mean, sd))
+```
+
+#### ER Cox model 1: ER- PRS + PCs
+```{r}
+cox.er1 <- coxph(Surv(fu_time, breast_death)~prs.erneg_norm + PC1+PC2+PC3+PC4+PC5+PC6+PC7+PC8+PC9+PC10, data=ukb_results)
+summary(cox.er1)
+
+```
+
+#### ER Cox model 2: ER- PRS + age, BMI, PCs
+```{r}
+cox.er2 <- coxph(Surv(fu_time, breast_death)~prs.erneg_norm + PC1+PC2+PC3+PC4+PC5+PC6+PC7+PC8+PC9+PC10, data=ukb_results)
+summary(cox.er2)
+
+```
+
+
+## **ROR-P PRS versus PRS for ER- vs ER+ disease**
+
+### FIG. S6A: Correlation between ROR-P PRS and PRS for ER- vs ER+ disease
+```{r, echo=FALSE, fig.align="center", out.width="50%", fig.show="hold"}
+
+ukb_scatter <- ggplot(ukb_results, aes(x=RORP_norm, y=log(prs.erneg))) + 
+  geom_point() + 
+  geom_smooth(method=lm) +
+  stat_cor(method = "spearman", label.x = 2, label.y = -4) + 
+  theme_classic() +
+  labs(x="ROR-P PRS", y=expression(PRS[ER*"-"*"/"*ER*"+"]))
+
+ukb_scatter
+ggsave(plot=ukb_scatter, filename=here("output/ukb_PRS_scatter.png"), bg="white", width=7, height=7)
+
+```
+
+### Joint model
+```{r}
+cox.rorp.er <- coxph(Surv(fu_time, breast_death) ~ RORP_norm + prs.erneg_norm + PC1+PC2+PC3+PC4+PC5+PC6+PC7+PC8+PC9+PC10, data=ukb_results)
+summary(cox.rorp.er)
+
+```
+
+
+## *PRS313 for overall breast cancer*
+
+*39 SNPs not available in UK Biobank, so technically PRS274
+
+### Load and prep PRS data
+
+```{r}
+prs313 <- read.table(paste0(datapath, "PRS_ukb_prs313.txt"), header=F)
+
+prs313 <- prs313 %>% 
+  rename(eid = V1, prs313 = V2, race = V3) %>%
+  select(-race) %>%
+  mutate_at(vars(eid), as.character)
+
+ukb_results <- ukb_results %>% inner_join(prs313, by="eid")
+
+```
+
+
+### Histogram of PRS274
+```{r, echo=FALSE, fig.align="center", out.width="50%", fig.show="hold", eval=FALSE}
+
+ggplot(ukb_results, aes(log(prs313))) + geom_histogram(binwidth=0.1, color="black", fill="lightblue") + theme_clean() +
+  ggtitle("Distribution of PRS313")
+
+```
+
+
+## **Survival analysis**
+
+### Kaplan Meier
+```{r}
+ukb_results <- ukb_results %>% 
+  mutate(prs313.tert = ntile(prs313, 3)) %>%
+  mutate(fu_yrs = fu_time/365)
+
+km <- with(ukb_results, Surv(fu_yrs, breast_death))
+km_pc_fit_prs313 <- survfit(Surv(fu_yrs, breast_death)~prs313.tert, data=ukb_results)
+
+```
+
+
+### FIG. 4: KM for overall BC PRS in tertiles
+Note: Quartile 1 corresponds to lowest PRS, Quartile 4 corresponds to highest PRS
+```{r, echo=FALSE, fig.align="center", out.width="75%"}
+
+
+ukb_PRS313 <- ggsurvplot(km_pc_fit_prs313, data = ukb_results, 
+           pval=TRUE, pval.method=T, conf.int=F,
+           ylim=c(0.80,1), xlim=c(0,10), break.time.by=2, xlab = "Time (years)",
+           pval.coord = c(8, 0.835), pval.method.coord = c(8, 0.85),
+           legend = c(0.15, 0.25), legend.labs=c("Bottom", "Middle", "Top"), legend.title=expression(Tertiles~of~PRS313),
+           risk.table = T, risk.table.height = 0.3, tables.theme=theme_survminer(), risk.table.fontsize=4,
+           ggtheme=theme_classic(), palette=c("#482677FF", "#1F968BFF", "#FDE725FF"),
+           font.x = c(14), font.y = c(14),
+           font.tickslab = c(12))
+
+grid.draw.ggsurvplot <- function(x){
+  survminer:::print.ggsurvplot(x, newpage = FALSE)
+}
+
+ggsave(here("output/Fig4.eps"), plot=ukb_PRS313, dpi=600, width=10, height=7, units="in")
+ukb_PRS313
+```
+
+
+### Normalized PRS313 for Cox model
+```{r}
+ukb_results <- ukb_results %>%
+  mutate(mean = mean(prs313, na.rm=T),
+         sd = sd(prs313, na.rm=T),
+         prs313_norm = (prs313 - mean)/sd) %>%
+  select(-c(mean, sd))
+```
+
+### Cox model 1: adjusted for genetic ancestry
+
+```{r}
+cox.prs313 <- coxph(Surv(fu_time, breast_death)~prs313_norm + PC1+PC2+PC3+PC4+PC5+PC6+PC7+PC8+PC9+PC10, data=ukb_results)
+summary(cox.prs313)
+
+```

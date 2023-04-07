@@ -1,0 +1,93 @@
+---
+title: "Meta-analysis"
+date: "`r format(Sys.time(), '%d %B %Y')`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(metafor)
+library(here)
+```
+
+### Input HR
+```{r}
+# ROR-P PRS
+hr1    <- c(1.13, 1.14)
+ci.lb1 <- c(1.04, 1.01)
+ci.ub1 <- c(1.23, 1.29)
+
+yi1  <- log(hr1) 
+sei1  <- (log(ci.ub1) - log(ci.lb1)) / (2*1.96)
+hrs1 <- data.frame(yi=yi1, sei=sei1)
+
+# ER- PRS
+hr2    <- c(1.15, 1.12)
+ci.lb2 <- c(1.07, 1.00)
+ci.ub2 <- c(1.23, 1.26)
+
+yi2  <- log(hr2) 
+sei2  <- (log(ci.ub2) - log(ci.lb2)) / (2*1.96)
+hrs2 <- data.frame(yi=yi2, sei=sei2)
+
+# Joint
+hr3    <- c(1.09, 1.11)
+ci.lb3 <- c(1.00, 0.97)
+ci.ub3 <- c(1.19, 1.27)
+
+yi3  <- log(hr3) 
+sei3  <- (log(ci.ub3) - log(ci.lb3)) / (2*1.96)
+hrs3 <- data.frame(yi=yi3, sei=sei3)
+
+```
+
+
+### Add annotations, define results
+```{r}
+trial <- 1:2 
+author <- c("UKB", "Pathways")
+
+hrtable1 <- cbind.data.frame(trial=trial, author=author, hrs1)
+hrtable2 <- cbind.data.frame(trial=trial, author=author, hrs2)
+hrtable3 <- cbind.data.frame(trial=trial, author=author, hrs3)
+
+res1 <- rma(yi, sei=sei, data=hrtable1, method="REML")
+res2 <- rma(yi, sei=sei, data=hrtable2, method="REML")
+res3 <- rma(yi, sei=sei, data=hrtable3, method="REML")
+
+res1
+res2
+res3
+```
+
+
+### Results
+```{r, echo=FALSE, fig.align="center", out.width="150%", fig.show="hold"}
+par(mfcol=c(1,3))
+forest(res1, transf=exp, refline =1, header=T, slab=c("UK Biobank", "Pathways Study"), main="ROR-P PRS", cex=1.5, cex.lab=1)
+forest(res2, transf=exp, refline =1, header=T, slab=c("UK Biobank", "Pathways Study"), main=expression(bold(PRS[ER*"-"*"/"*ER*"+"])), cex=1.5, cex.lab=1)
+forest(res3, transf=exp, refline =1, header=T, slab=c("UK Biobank", "Pathways Study"), main = "ROR-P PRS in Joint Model", cex=1.5, cex.lab=1)
+```
+
+
+### Save as png
+```{r, eval=FALSE}
+png(here("output/forest_panels.png"), width=12, height=6, units="in", res=720)
+par(mfcol=c(1,3))
+forest(res1, transf=exp, refline =1, header=T, slab=c("UK Biobank", "Pathways Study"), main="ROR-P PRS", cex=1.5, cex.lab=1)
+forest(res2, transf=exp, refline =1, header=T, slab=c("UK Biobank", "Pathways Study"), main=expression(bold(PRS[ER*"-"*"/"*ER*"+"])), cex=1.5, cex.lab=1)
+forest(res3, transf=exp, refline =1, header=T, slab=c("UK Biobank", "Pathways Study"), main = "ROR-P PRS in Joint Model", cex=1.5, cex.lab=1)
+dev.off()
+```
+
+
+### Save as eps
+```{r}
+setEPS()
+postscript(here("output/Fig5.eps"), width=18, height=8)
+par(mfcol=c(1,3))
+forest(res1, transf=exp, refline =1, header=T, slab=c("UK Biobank", "Pathways Study"), main="ROR-P PRS", cex=1.5, cex.lab=1)
+forest(res2, transf=exp, refline =1, header=T, slab=c("UK Biobank", "Pathways Study"), main=expression(bold(PRS[ER*"-"*"/"*ER*"+"])), cex=1.5, cex.lab=1)
+forest(res3, transf=exp, refline =1, header=T, slab=c("UK Biobank", "Pathways Study"), main = "ROR-P PRS in Joint Model", cex=1.5, cex.lab=1)
+dev.off()
+```
+

@@ -1,0 +1,226 @@
+---
+title: "PRS building through cross-validation"
+date: "`r format(Sys.time(), '%d %B %Y')`"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(here)
+library(caret)
+library(ggpubr)
+library(survival)
+library(survminer)
+```
+*Version notes:*
+
+* Cross-validation with 10 repeats
+* Candidate SNPs are GWAS hits with LD pruning at r2 threshold of 0.2
+* Final SNP coefficients derived *with* adjustment for genetic ancestry, study but not ER status
+* Manual "flip" of 2 SNPs (rs141526427 & rs138044103) in METABRIC given different ref allele was called
+
+### Cross-validation to identify optimal p-value cutoff
+
+```{r}
+# Load data
+load(here("/Volumes/Shieh-share$/SNPTumor/data/processed/TCGA_MB_ISPY_geno.pheno.RData"))
+dat <- all_shared_pcs_noNA_noLD
+
+# Manual "flip" of SNPs in MB due to difference in index allele
+mbdat <- dat %>% filter(study %in% "mb")
+nomb <- dat %>% filter(!(study %in% "mb"))
+
+mbdat <- mbdat %>% mutate(rs138044103 = case_when(
+  rs138044103 == 0 & study %in% "mb" ~ 2,
+  rs138044103 == 1 & study %in% "mb" ~ 1,
+  rs138044103 == 2 & study %in% "mb" ~ 0
+))
+
+mbdat <- mbdat %>% mutate(rs141526427 = case_when(
+  rs141526427 == 0 & study %in% "mb" ~ 2,
+  rs141526427 == 1 & study %in% "mb" ~ 1,
+  rs141526427 == 2 & study %in% "mb" ~ 0
+))
+
+dat <- rbind(nomb, mbdat)
+
+# Toggle inclusion of these SNPs
+#dat <- dat %>% select(-c(rs138044103, rs141526427))
+totcol <- ncol(dat)
+
+# Residuals for model adjusted for ancestry, and study
+lm12 <- lm(RORP ~ .-RORP, data=dat[,c(2:11, 13, 15)])
+res_vals <- data.frame(lm12$residuals)
+names(res_vals) <- c("lm12_res")
+snp_pvals_lm12_res <- c()
+
+wheresnps <- grepl('^rs', colnames(dat))
+firstsnpcol <- min(which(wheresnps==T))
+
+# Get p-values for each SNP
+for (s in firstsnpcol:totcol) {
+  # Build regression models based on residuals from lm7 and lm8
+  lm13_data <- res_vals %>%
+    mutate(snp_vals=unlist(dat[,s]))
+  lm13 <- lm(lm12_res ~ .-lm12_res, data=lm13_data)
+  # Add to p-val vectors
+  snp_pvals_lm12_res <- c(snp_pvals_lm12_res, summary(lm13)$coefficients[2,4])
+}
+
+#thresholds <- c(0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1) # first pass
+#thresholds <- c(0.5, 0.475, 0.450, 0.425, 0.4, 0.375, 0.35, 0.325, 0.3, 0.275, 0.25, 0.225, 0.2, 0.175, 0.15, 0.125, 0.1, 0.075, 0.05, 0.025) # second pass
+thresholds <- c(0.6, 0.575, 0.55, 0.525, 0.5, 0.475, 0.450, 0.425, 0.4, 0.375, 0.35, 0.325, 0.3, 0.275, 0.25, 0.225, 0.2, 0.175, 0.15, 0.125, 0.1, 0.075, 0.05) # for table
+
+# Define training control
+set.seed(123)
+tc <- trainControl(method = "repeatedcv", number = 5, repeats = 10)
+table <- data.frame(pval=numeric(),
+                    numsnps = numeric(),
+                    rmse = numeric(),
+                    rsq = numeric(),
+                    mae = numeric())
+i <- 1
+
+
+# Evaluate each threshold
+for (t in thresholds) {
+  # Set which SNPs have p-values at or below the threshold using a binary mask
+  # for columns to be included in the model
+  col_mask1 <- ifelse(snp_pvals_lm12_res <= t, TRUE, FALSE)
+  # Hardcode to exclude ancestry & study and include RORP
+  col_mask2 <- c(FALSE, rep(FALSE, 10), FALSE, TRUE, FALSE, FALSE, col_mask1)
+  # Compute the number of SNPs included
+  num_snps <- sum(col_mask1)
+  # Pull together dataframe for the model to be built on
+  lm14_data <- dat[,col_mask2]
+  # Build linear model and do 5fold CV
+  set.seed(123)
+  lm14 <- train(RORP ~ .-RORP, data = lm14_data, method = "lm", trControl = tc)
+  # Summarize the results
+  vec <- c(t, num_snps, lm14$results[,2], lm14$results[,3], lm14$results[,4])
+  table[i,] <- vec
+  i <- i+1
+}
+
+knitr::kable(table, 
+             caption = "Model performance by p-value threshold",
+             col.names = c('p-value threshold', 'Number of SNPs', 'RMSE', 'R-squared', 'MAE'))
+```
+_From these results, p = 0.375 appears to be optimal threshold with r2 = 0.049_
+
+
+### Table S5: p-val thresholds, #SNPs, r-squared
+```{r}
+pubtable <- table %>%
+  mutate(RMSE = format(round(rmse, 2), nsmall=2),
+         `R-squared` = format(round(rsq, 4), nsmall=4),
+         MAE = format(round(mae, 2), nsmall=2)) %>%
+  rename(`p-value threshold` = pval,
+         `Number of SNPs` = numsnps) %>%
+  select(-c(rmse, rsq, mae))
+  
+write.table(pubtable, here("output/CVresults_0.375_noER_rorp76.txt"), quote = F, sep = "\t", col.names = T, row.names = F)
+```
+
+
+### Fit PRS using SNPs meeting p-value cutoff
+```{r}
+col_mask <- ifelse(snp_pvals_lm12_res <= 0.375, TRUE, FALSE)
+col_mask <- c(FALSE, rep(TRUE, 10), FALSE, TRUE, FALSE, TRUE, col_mask)
+lm_noER_data <- dat[,col_mask]
+lm_noER <- lm(RORP ~ .-RORP, data=lm_noER_data)
+snpcoeff_noER <- as.data.frame(lm_noER$coefficients[-c(1:13)])
+snpcoeff_noER <- rename(snpcoeff_noER, coeff=`lm_noER$coefficients[-c(1:13)]`)
+```
+
+### Save SNP coefficients
+```{r, eval=TRUE}
+snpcoeff_rorp76 <- snpcoeff_noER
+
+save(snpcoeff_rorp76, 
+     file = "/Volumes/Shieh-share$/SNPTumor/data/processed/snpcoeff_rorp76.RData")
+```
+
+
+### FIG. 2A: R2 plot
+```{r, echo=FALSE, fig.align="center", out.width="75%"}
+
+r2plot <- table %>%
+  ggplot(aes(pval, rsq, palette="npg")) + geom_line() + geom_point(stat="identity") + theme_classic() +
+  scale_x_continuous(breaks=seq(0,0.6,0.05)) +
+  labs(x="p-value", y=expression(r^2), tag="a") +
+  theme(axis.title.x = element_text(size=12), axis.title.y = element_text(size=12),
+        axis.text.x=element_text(size=10), axis.text.y=element_text(size=10), 
+        plot.tag=element_text(size=18, face="bold")) + 
+  scale_y_continuous(expand = c(0, 0), limits = c(0, NA)) +
+  coord_cartesian(clip = "off")
+
+r2plot
+
+ggsave(plot=r2plot, filename = here("output/Fig2a.eps"), height=6, width=8)
+```
+
+
+### FIG. 2B: Volcano plot
+```{r, echo=FALSE, fig.align="center", out.width="75%"}
+
+wheresnps <- grepl('^rs', colnames(dat))
+firstsnpcol <- min(which(wheresnps==T))
+
+lm15_table <- data.frame(rsid=character(),
+                    coefficient = numeric(),
+                    pval = numeric())
+i <- 1
+
+# Get p-values for each SNP
+for (s in firstsnpcol:totcol) {
+  # Build regression models based on residuals from lm7 and lm8
+  lm15_data <- dat %>%
+    select(RORP, contains("PC"), study) %>%
+    mutate(snp_vals=unlist(dat[,s]))
+  lm15 <- lm(RORP ~ .-RORP, data=lm15_data)
+  # Add to results table
+  vec <- c(colnames(dat)[s], summary(lm15)$coefficients[-c(1:13), 1], summary(lm15)$coefficients[-c(1:13), 4])
+  lm15_table[i,] <- vec
+  i <- i+1
+}
+
+lm15_table <- lm15_table %>%
+  mutate(res_pval = snp_pvals_lm12_res) %>%
+  mutate_at(vars(coefficient, pval), as.numeric)
+
+vplot <- lm15_table %>%
+  filter(., pval != 0) %>%
+  mutate(colorcode = case_when(pval < .05 ~ "nominally significant",
+                           (rsid %in% rownames(snpcoeff_noER)) ~ "in model",
+                           !(rsid %in% rownames(snpcoeff_noER)) ~ "not in model")) %>%
+  ggplot(aes(x=coefficient, y=-log10(pval))) + 
+  geom_point(aes(color=colorcode), size=2) +
+  geom_text(data=filter(lm15_table, pval < .05), aes(label=rsid), vjust=-1) +
+  theme_bw() +
+  xlim(-5,3) + ylim(0, 3) +
+  labs(x="coefficient", y="-log10(p-value)", tag="b") +
+  scale_colour_manual(values = c("nominally significant"= "red", "in model"= "orange", "not in model" = "black"), "Legend") +
+  theme(axis.title.x = element_text(size=12), axis.title.y = element_text(size=12),
+        axis.text.x=element_text(size=10), axis.text.y=element_text(size=10), legend.position = c(0.15,0.8),
+        plot.tag=element_text(size=18, face="bold")) +
+   theme(legend.background = element_rect(colour = 'black', fill = 'white', linetype='solid'))
+
+vplot
+
+ggsave(plot=vplot, filename = here("output/Fig2b.eps"), height=6, width=8)
+
+```
+
+
+### Table S6: PRS SNPs
+```{r, eval=TRUE}
+table_s6 <- lm15_table %>%
+  filter(res_pval < 0.375) %>%
+  select(rsid, coefficient, pval)
+
+write.table(table_s6, file=here("output/rorp76_results.txt"), quote = F, col.names = T, row.names = F, sep = "\t")
+```
+

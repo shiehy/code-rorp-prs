@@ -1,0 +1,688 @@
+---
+title: "KP PRS Analysis"
+date: "`r format(Sys.time(), '%d %B %Y')`"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning=FALSE, message=FALSE, fig.show="hold")
+library(tidyverse)
+library(here)
+library(survival)
+library(survminer)
+library(ggthemes)
+library(ggpubr)
+library(ggsci)
+library(gridExtra)
+library(knitr)
+library(gtsummary)
+library(webshot)
+library(survMisc)
+library(ggpubr)
+library(gtable)
+```
+*Version notes:*
+
+* Publication version
+
+## *ROR-P PRS*
+
+### Load and prep data
+
+```{r}
+load("/Volumes/Shieh-share$/KP_Pathways/data/KP_cleaned.Rdata")
+load(here("/Volumes/Shieh-share$/SNPTumor/data/processed/snpcoeff_rorp76.RData"))
+
+betas <- snpcoeff_rorp76
+
+dat <- kp.clin.geno.ror %>% filter(RaceEthn1==1)
+dat <- dat %>% 
+  select(ID, breast_death, fu_time, dx_age, pw_ER, pw_HER2, pw_grade, pw_subtype_IHC, BMI_PW, 
+         pw_horm_yn, pw_chemo_yn, pw_rad_yn, pw_herceptin_yn, pw_taxane_yn, 
+         fu_time_recur, recur, pw_ajcc_tnm6, RORP, RORPG,
+         any_of(starts_with("PC")), any_of(rownames(betas))) %>%
+  mutate_at(vars(pw_ajcc_tnm6), 
+            ~case_when(.x == 0 ~ "Stage 0",
+                       .x == 10 ~ "Stage I",
+                       .x %in% c(30:40) ~ "Stage II",
+                       .x %in% c(50:60) ~ "Stage III",
+                       .x == 70 ~ "Stage IV",
+                       .x == 99 ~ "Unknown Stage"
+            )) %>% 
+  relocate(starts_with("rs"), .after=last_col()) %>%
+  relocate(contains(":"), .after=last_col())
+
+wheresnps <- grepl('^rs', colnames(dat))
+firstsnpcol <- min(which(wheresnps==T))
+
+# Set missing SNPs to 0
+snps <- rownames(betas)
+totcol <- ncol(dat)
+inkp <- colnames(dat[,firstsnpcol:totcol])
+miss.snps <- setdiff(snps,inkp)
+
+miss.snps.geno <- as.data.frame(matrix(data = 0, nrow = nrow(dat), ncol = length(miss.snps)))
+colnames(miss.snps.geno) <- miss.snps
+dat <- cbind(dat, miss.snps.geno)
+
+```
+
+### Calculate PRS
+
+```{r}
+
+kp_snps <- dat %>% select(all_of(snps))
+
+weighted.score <- as.matrix(kp_snps) %*% betas$coeff
+  
+kp_results <- cbind(weighted.score, dat[,c(1:(paste0(firstsnpcol-1)))])
+kp_results <- rename(kp_results, rorp_prs =weighted.score)
+
+kp_results <- kp_results %>%
+  mutate(pw_subtype_IHC_comb = if_else(as.character(pw_subtype_IHC) %in% c("Luminal B", "HER2"), 
+                                       "Luminal B/HER2", as.character(pw_subtype_IHC)))
+
+print(paste0("Number of SNPs in KP PRS: ", length(inkp)))
+
+# Normalize to mean
+kp_results <- kp_results %>%
+  mutate(mean = mean(rorp_prs, na.rm=T),
+         sd = sd(rorp_prs, na.rm=T),
+         rorp_prs_norm = (rorp_prs - mean)/sd,
+         pw_subtype_IHC_comb = factor(pw_subtype_IHC_comb, levels = c("Luminal A", "Luminal B/HER2", "Basal"))) %>%
+  select(-c(mean, sd))
+```
+
+
+## **Data exploration**
+
+### FIG. S3B: Histogram of ROR-P PRS
+```{r, echo=FALSE, fig.align="center", out.width="50%", fig.show="hold"}
+
+prs_hist <- ggplot(kp_results, aes(rorp_prs)) + 
+  geom_histogram(binwidth=1, color="black", fill="lightblue") + theme_minimal() +
+  ggtitle("Pathways Study") +
+  scale_x_continuous("ROR-P PRS", limits=c(-50,0), breaks=seq(-50,0,10)) +
+  theme(plot.title = element_text(hjust = 0.5, size=14, face="bold"), axis.title.x = element_text(size=12),
+                          axis.title.y = element_text(size=12))
+
+prs_hist
+
+ggsave(plot=prs_hist, filename=here("output/PW_RORP-PRS_dist.png"), width = 8, height=4, bg = "white")
+
+# Mean/SD overall
+kp_results %>% 
+  plyr::summarize(mean_rorp_prs = mean(rorp_prs),
+            sd_rorp_prs = sd(rorp_prs))
+```
+
+
+### FIG. S7A: Histogram of PRS color coded by ER status
+```{r, echo=FALSE, fig.align="center", out.width="50%", fig.show="hold"}
+prs_hist_byER <- kp_results %>%
+  filter(!is.na(pw_ER)) %>%
+  ggplot(aes(x=rorp_prs, fill=pw_ER)) + 
+  geom_density(color="black", alpha=0.5, position="identity") + theme_minimal() +
+  ggtitle("Pathways Study by ER status") +
+  labs(x="ROR-P PRS") +
+  theme(plot.title = element_text(hjust = 0.5, size=14, face="bold"), axis.title.x = element_text(size=12),
+                          axis.title.y = element_text(size=12)) +
+  scale_fill_discrete(name="ER status", labels=c("positive", "negative"))
+
+ggsave(plot=prs_hist_byER, filename=here("output/PW_RORP-PRS_dist_byER.png"), width = 8, height=4, bg = "white")
+prs_hist_byER
+
+t.test(kp_results$rorp_prs ~ kp_results$pw_ER)
+```
+
+Mean/SD ER Positive
+```{r}
+kp_results %>% 
+  filter(pw_ER == "positive") %>% 
+  summarize(mean_rorp_prs = mean(rorp_prs),
+            sd_rorp_prs = sd(rorp_prs))
+```
+Mean/SD ER Negative
+```{r}
+kp_results %>% 
+  filter(pw_ER == "negative") %>% 
+  summarize(mean_rorp_prs = mean(rorp_prs),
+            sd_rorp_prs = sd(rorp_prs))
+```
+
+
+### FIG. 3A: correlation between ROR-P PRS and ROR-P, by ER status
+```{r, echo=FALSE, fig.align="center", out.width="50%", fig.show="hold"}
+kp_results_genexp <- kp_results %>%
+  filter(!is.na(RORP))
+
+rorscatter <- ggplot(kp_results_genexp, aes(x=rorp_prs_norm, y=RORP)) + 
+  geom_point(aes(shape=pw_ER)) + 
+  theme_classic() +
+  geom_smooth(method=lm) +
+  stat_cor(method = "pearson", label.x = 1.5, label.y = 90) + 
+  scale_shape_manual(values=c(19,1)) +
+  labs(x="ROR-P PRS", y="ROR-P", tag="a") +
+  guides(shape = guide_legend(title = "ER status")) +
+  theme(axis.title.x = element_text(size=12), axis.title.y = element_text(size=12),
+        axis.text.x=element_text(size=10), axis.text.y=element_text(size=10), 
+        plot.tag=element_text(size=18, face="bold"))
+
+rorscatter
+
+ggsave(plot=last_plot(), filename=here("output/Fig3a.eps"), device=cairo_ps, width=8, height=6)
+```
+
+
+### FIG. 3B: ROR-P PRS vs tumor char, forest plots
+```{r, echo=FALSE, fig.align="center", out.width="50%", fig.show="hold"}
+
+#1 ER status
+er.model <- glm(pw_ER ~ rorp_prs_norm + PC1+PC2+PC3+PC4+PC5+PC6+PC7+PC8+PC9+PC10, 
+                 family=binomial(link='logit'), data=kp_results)
+gtsummary::tbl_regression(er.model, include=c(rorp_prs_norm), exp = TRUE) %>% as_gt() %>% gt::tab_header(title="ER")
+
+# plot of ER status
+
+df.er <- data.frame(Model="ER-negative vs. ER-positive",
+                    OR=exp(er.model$coefficients[[2]]),
+                    Lower=exp(confint(er.model)[[2,1]]),
+                    Upper=exp(confint(er.model)[[2,2]]))
+
+p.er <- ggplot(df.er, aes(x=Model, y=OR, ymin=Lower, ymax=Upper)) + 
+  geom_errorbar(width = 0.1) +
+  geom_hline(yintercept=1, lty=2) +
+  geom_point() +
+  geom_text(aes(y = 1.45, label = paste(round(OR,2)," (",round(Lower,2),", ",round(Upper,2),")", sep = ""), hjust=0)) +
+  scale_x_discrete(name="ER Status") + labs(tag="b") +
+  scale_y_continuous(name="Odds ratio (log10 scale)", limits = c(0.7, 1.7), trans = "log10", breaks = c(0.8,1,1.2,1.4), minor_breaks = NULL) +
+  coord_flip() +
+  theme(panel.grid.major.y = element_blank(), plot.tag=element_text(size=18, face="bold"))
+#theme_minimal()
+
+#p.er
+
+#2 HER2
+her2.model <- glm(pw_HER2 ~ rorp_prs_norm + PC1+PC2+PC3+PC4+PC5+PC6+PC7+PC8+PC9+PC10, 
+                 family=binomial(link='logit'), data=kp_results)
+gtsummary::tbl_regression(her2.model, include = c(rorp_prs_norm), exp = TRUE) %>% as_gt() %>% gt::tab_header(title="HER2")
+
+kp_results <- kp_results %>%
+  mutate_at(vars(pw_grade), as.factor)
+
+
+df.her2 <- data.frame(Model="HER2-negative vs. HER2-positive",
+                      OR=exp(her2.model$coefficients[[2]]),
+                      Lower=exp(confint(her2.model)[[2,1]]),
+                      Upper=exp(confint(her2.model)[[2,2]]))
+
+p.her2 <- ggplot(df.her2, aes(x=Model, y=OR, ymin=Lower, ymax=Upper)) + 
+  geom_errorbar(width = 0.1) +
+  geom_hline(yintercept=1, lty=2) +
+  geom_point() +
+  geom_text(aes(y = 1.45, label = paste(format(round(OR,2),nsmall=2)," (",round(Lower,2),", ",round(Upper,2),")", sep = ""), hjust=0)) +
+  scale_x_discrete(name="HER2 Status") +
+  scale_y_continuous(name="Odds ratio (log10 scale)", limits = c(0.7, 1.7), trans = "log10", breaks = c(0.8,1,1.2,1.4), minor_breaks = NULL) +
+  coord_flip() +
+  theme(panel.grid.major.y = element_blank())
+
+
+# ordinal grade - leave out
+grade.model <- MASS::polr(pw_grade ~ rorp_prs_norm + PC1+PC2+PC3+PC4+PC5+PC6+PC7+PC8+PC9+PC10, data=kp_results, Hess=T)
+ctable <- coef(summary(grade.model))
+p <- pnorm(abs(ctable[, "t value"]), lower.tail = FALSE) * 2
+ctable <- cbind(ctable, "p value" = p)
+#ci <- confint(grade.model)
+#exp(cbind(OR = coef(grade.model), ci))
+
+# 3 multinomial grade
+library(nnet)
+grade.model2 <- multinom(relevel(pw_grade, ref="1") ~ rorp_prs_norm + PC1+PC2+PC3+PC4+PC5+PC6+PC7+PC8+PC9+PC10, family=binomial(link='logit'), data=kp_results)
+gtsummary::tbl_regression(grade.model2, include = c(rorp_prs_norm), exp = TRUE) %>% as_gt() %>% gt::tab_header(title="Grade")
+
+df.grade <- data.frame(Model=c("Grade 3 vs. Grade 1", "Grade 2 vs. Grade 1"),
+                       OR=c(exp(coef(grade.model2)[[2,2]]), exp(coef(grade.model2)[[1,2]])),
+                       Lower=c(exp(confint(grade.model2)[26]), exp(confint(grade.model2)[2])),
+                       Upper=c(exp(confint(grade.model2)[38]), exp(confint(grade.model2)[14]))) %>% 
+  mutate(Model = factor(Model, levels = c("Grade 3 vs. Grade 1", "Grade 2 vs. Grade 1")))
+
+p.grade <- ggplot(df.grade, aes(x=Model, y=OR, ymin=Lower, ymax=Upper)) +
+  geom_errorbar(width = 0.2) +
+  geom_hline(yintercept=1, lty=2) +
+  geom_point() +
+  geom_text(aes(y = 1.45, label = paste(round(OR,2)," (",round(Lower,2),", ",round(Upper,2),")", sep = ""), hjust=0)) +
+  scale_x_discrete(name="Grade") +
+  scale_y_continuous(name="Odds ratio (log10 scale)", limits = c(0.7, 1.7), trans = "log10", breaks = c(0.8,1,1.2,1.4), minor_breaks = NULL) +
+  coord_flip() +
+  theme(panel.grid.major.y = element_blank())
+#p.grade
+
+# 4 multinomial subtype
+subtype.model <- multinom(relevel(pw_subtype_IHC, ref="Luminal A")~rorp_prs_norm + PC1+PC2+PC3+PC4+PC5+PC6+PC7+PC8+PC9+PC10, 
+                          family=binominal(link='logit'), data=kp_results)
+gtsummary::tbl_regression(subtype.model, include = c(rorp_prs_norm), exp=TRUE) %>% as_gt() %>% gt::tab_header(title="Subtype")
+
+df.subtype <- data.frame(Model=c("Luminal B vs. Luminal A", "Basal vs. Luminal A", 
+                          "HER2 vs. Luminal A"),
+                         OR=c(exp(coef(subtype.model)[[1,2]]), exp(coef(subtype.model)[[2,2]]),
+                            exp(coef(subtype.model)[[3,2]])),
+                         Lower=c(exp(confint(subtype.model)[2]), exp(confint(subtype.model)[26]),
+                            exp(confint(subtype.model)[50])),
+                         Upper=c(exp(confint(subtype.model)[14]), exp(confint(subtype.model)[38]),
+                            exp(confint(subtype.model)[62])))
+
+p.subtype <- ggplot(df.subtype, aes(x=Model, y=OR, ymin=Lower, ymax=Upper)) +  
+  geom_errorbar(width = 0.3) +
+  geom_hline(yintercept=1, lty=2) +
+  geom_point() +
+  geom_text(aes(y = 1.45, label = paste(round(OR,2)," (",round(Lower,2),", ",round(Upper,2),")", sep = ""), hjust=0)) +
+  scale_x_discrete(name="Intrinsic-like Subtype") +
+  scale_y_continuous(name="Odds ratio (log10 scale)", limits = c(0.7, 1.7), trans = "log10", breaks = c(0.8,1,1.2,1.4), minor_breaks = NULL) +
+  coord_flip() +
+  theme(panel.grid.major.y = element_blank())
+
+# combine all 4 plots using cowplot
+library(cowplot)
+forest_rorpprs <- plot_grid(p.er, p.her2, p.grade, p.subtype, ncol = 1, align = "hv")
+forest_rorpprs
+
+ggsave(plot=forest_rorpprs, filename=here("output/Fig3b.eps"), width=10, height=7)
+
+```
+
+
+## **Survival analysis**
+
+### Kaplan Meier analysis
+```{r}
+kp_results <- kp_results %>% 
+  mutate(prs.tert = ntile(rorp_prs, 3),
+         prs.2 = ntile(rorp_prs, 2)) %>%
+  mutate(fu_yrs = fu_time/365)
+
+km <- with(kp_results, Surv(fu_yrs, breast_death))
+km_pc_fit_tert <- survfit(Surv(fu_yrs, breast_death)~prs.tert, data=kp_results)
+km_pc_fit_2 <- survfit(Surv(fu_yrs, breast_death)~prs.2, data=kp_results)
+
+kp_results_stage <- kp_results %>% 
+  filter(pw_ajcc_tnm6 %in% c("Stage I", "Stage II", "Stage III", "Stage IV"))
+```
+
+
+### FIG. 6B: KM for tertiles of ROR-P PRS
+Note: Tertile 1 corresponds to lowest risk of elevated RORP, Tertile 3 corresponds to highest risk of elevated RORP
+``` {r, echo=FALSE, fig.align="center", out.width="100%", warning=FALSE, message=FALSE}
+km_rorpPRS_3 <- ggsurvplot(km_pc_fit_tert, data = kp_results, 
+           pval=TRUE, pval.method=T, conf.int=F, title="b",
+           ylim=c(0.80,1), xlim=c(0,12), break.time.by=2, xlab = "Time (years)",
+           pval.coord = c(10, 0.835), pval.method.coord = c(10, 0.85),
+           legend = c(0.15, 0.25), legend.labs=c("Bottom", "Middle", "Top"), legend.title="Tertiles of ROR-P PRS",
+           risk.table = T, risk.table.height = 0.3, tables.theme=theme_survminer(), risk.table.fontsize=4,
+           ggtheme=theme_classic(), palette=c("#482677FF", "#1F968BFF", "#FDE725FF"),
+           font.x = c(14), font.y = c(14),
+           font.tickslab = c(12))
+
+km_rorpPRS_3$plot <- km_rorpPRS_3$plot + theme(plot.title=element_text(hjust=-0.1, face="bold", size=18))
+
+grid.draw.ggsurvplot <- function(x){
+  survminer:::print.ggsurvplot(x, newpage = FALSE)
+}
+
+ggsave(here("output/Fig6b.eps"), plot=km_rorpPRS_3, dpi=600, width=10, height=7, units="in")
+km_rorpPRS_3
+survdiff(km ~ prs.tert, data = kp_results)
+```
+
+
+### Cox Models 
+
+#### Cox Model 1a, ROR-P PRS + PCs
+```{r}
+cox.norm1 <- coxph(Surv(fu_time, breast_death) ~ rorp_prs_norm + PC1+PC2+PC3+PC4+PC5+PC6+PC7+PC8+PC9+PC10, data=kp_results)
+summary(cox.norm1)
+```
+
+#### Cox Model 1b, ROR-P PRS + PCs, stratified by ER status
+```{r}
+cox.norm1b <- coxph(Surv(fu_time, breast_death) ~ rorp_prs_norm + PC1+PC2+PC3+PC4+PC5+PC6+PC7+PC8+PC9+PC10 + strata(pw_ER), data=kp_results)
+summary(cox.norm1b)
+```
+
+
+#### Cox Model 1c, ROR-P PRS + PCs, ER pos only
+```{r}
+kp_erpos <- kp_results %>% filter(pw_ER %in% "positive" )
+cox.norm1c <- coxph(Surv(fu_time, breast_death) ~ rorp_prs_norm + PC1+PC2+PC3+PC4+PC5+PC6+PC7+PC8+PC9+PC10, data=kp_erpos)
+summary(cox.norm1c)
+```
+
+#### Cox Model 1d, ROR-P PRS + PCs, ER neg only
+```{r}
+kp_erneg <- kp_results %>% filter(pw_ER %in% "negative" )
+cox.norm1d <- coxph(Surv(fu_time, breast_death) ~ rorp_prs_norm + PC1+PC2+PC3+PC4+PC5+PC6+PC7+PC8+PC9+PC10, data=kp_erneg)
+summary(cox.norm1d)
+```
+
+
+#### FIG. S7B: Forest plot of Cox model results by ER status
+```{r, echo=FALSE, fig.align="center", out.width="100%", warning=FALSE, message=FALSE}
+
+df <- data.frame(Model=c("ER positive", "ER negative"),
+                      OR=c(1.23,0.87),
+                      Lower=c(1.06,0.67),
+                      Upper=c(1.43,1.12)) %>%
+  mutate(Model = factor(Model, levels=c("ER positive", "ER negative")))
+
+p <- ggplot(df, aes(x=Model, y=OR, ymin=Lower, ymax=Upper)) +
+  geom_errorbar(width = 0.2) +
+  geom_hline(yintercept=1, lty=2) +
+  geom_point() +
+  geom_text(aes(y = 1.55, label = paste(round(OR,2)," (",round(Lower,2),", ",round(Upper,2),")", sep = ""), hjust=0), size=3) +
+  scale_x_discrete(name="ER status") +
+  scale_y_continuous(name="Hazard ratio (log10 scale)", limits = c(0.5, 2.0), trans = "log10", breaks = c(0.5,1,1.5), minor_breaks = NULL) +
+  coord_flip() +
+  theme_minimal() +
+  theme(panel.grid.minor = element_blank(), panel.grid.major.y = element_blank())
+p
+
+ggsave(plot=p, filename=here("output/PW_Forest_PRS_byER.png"), width = 6, height=2, bg = "white")
+
+```
+
+
+
+#### Cox Model 2, ROR-P PRS + age, BMI, PCs
+```{r}
+cox.norm2 <- coxph(Surv(fu_time, breast_death) ~ rorp_prs_norm + PC1+PC2+PC3+PC4+PC5+PC6+PC7+PC8+PC9+PC10 + 
+                     dx_age + BMI_PW, data=kp_results)
+summary(cox.norm2)
+```
+
+
+#### Cox Model 3, ROR-P PRS + age, BMI, PCs, stage
+```{r}
+cox.norm3 <- coxph(Surv(fu_time, breast_death) ~ rorp_prs_norm + PC1+PC2+PC3+PC4+PC5+PC6+PC7+PC8+PC9+PC10 + 
+                     dx_age + BMI_PW + pw_ajcc_tnm6, data=kp_results_stage)
+summary(cox.norm3)
+```
+
+
+
+#### Cox Model 4, ROR-P PRS + age, BMI, PCs, treatment variables
+```{r}
+cox.norm4 <- coxph(Surv(fu_time, breast_death) ~ rorp_prs_norm + PC1+PC2+PC3+PC4+PC5+PC6+PC7+PC8+PC9+PC10 
+                   + dx_age + BMI_PW+ pw_chemo_yn + pw_herceptin_yn + pw_horm_yn + pw_taxane_yn + pw_rad_yn +
+                   pw_ajcc_tnm6, data=kp_results_stage)
+summary(cox.norm4)
+```
+
+#### Cox Model 5, ROR-P PRS + PCs, adjusted for RORP
+```{r}
+cox.norm5 <- coxph(Surv(fu_time, breast_death) ~ rorp_prs_norm + RORP + PC1+PC2+PC3+PC4+PC5+PC6+PC7+PC8+PC9+PC10, 
+                   data=kp_results_genexp)
+summary(cox.norm5)
+```
+
+#### Cox Model 6, ROR-P PRS + PCs, adjusted for ER status
+```{r}
+cox.norm6 <- coxph(Surv(fu_time, breast_death) ~ rorp_prs_norm + PC1+PC2+PC3+PC4+PC5+PC6+PC7+PC8+PC9+PC10 + pw_ER, data=kp_results)
+summary(cox.norm6)
+  
+```
+
+
+## **PRS for ER-negative vs ER-positive disease**
+
+*This is a 189-SNP PRS:*
+
+* Started with 271 SNPs tested against RORP
+  + 237 had retrievable summary stats for ER- and ER+ disease in BCAC
+  + 205 left after LD pruning
+  + 189 were pulled in KP Pathways
+* Used ER-specific ORs from BCAC meta-analysis https://gwas.mrcieu.ac.uk/, datasets eu-a-1127 and eu-a-1128
+* Generated case-case betas by subtracting ER+ beta from ER- beta, then converted to OR
+* Oriented PRS input so that all ORs >= 1 and risk allele corresponds to the allele conferring greater ER- relative to ER+ risk
+
+### Load and prep data
+```{r}
+prs_erneg <- read.table("/Volumes/Shieh-share$/KP_Pathways/prs205/PRS_kp_ERprs.txt", header = F)
+prs_erneg <- prs_erneg %>% 
+  rename(ID = V1, prs.erneg = V2, race = V3) %>%
+  select(-race) %>%
+  mutate_at(vars(ID), as.character)
+
+kp_results <- left_join(kp_results, prs_erneg, by="ID")
+
+```
+
+## *Data exploration*
+
+### FIG. S5: Boxplot of ER-negative PRS vs ER status
+```{r, echo=FALSE, fig.align="center", out.width="50%", fig.show="hold"}
+er.box <- kp_results %>%
+  filter(!is.na(pw_ER)) %>%
+  ggplot(aes(x=as.factor(pw_ER), y=log(prs.erneg), add="jitter", colour=pw_ER)) +
+  theme_classic() +
+  geom_boxplot() +
+  scale_color_npg() +
+  stat_compare_means(method="t.test", label.x=1.5) +
+  labs(x="ER status", y=expression(PRS[ER*"-"*"/"*ER*"+"]), color="ER status") +
+  theme(axis.title.x = element_text(size=14), axis.title.y = element_text(size=14),
+        axis.text.x=element_text(size=12), legend.position = "right")
+
+ggsave(plot=er.box, filename=here("output/PW_ERprs_box.png"), width = 12, height=8, bg = "white")
+er.box
+
+t.test(kp_results$prs.erneg ~ kp_results$pw_ER)
+
+```
+
+
+## **Survival analysis**
+
+### Kaplan-Meier analysis
+```{r}
+kp_results <- kp_results %>% 
+  mutate(prs.erneg.tert = ntile(prs.erneg, 3),
+         prs.erneg.2 = ntile(prs.erneg, 2)) %>%
+  mutate(fu_yrs = fu_time/365)
+
+km <- with(kp_results, Surv(fu_yrs, breast_death))
+km_pc_fit_erneg_tert <- survfit(Surv(fu_yrs, breast_death)~prs.erneg.tert, data=kp_results)
+km_pc_fit_erneg_2 <- survfit(Surv(fu_yrs, breast_death)~prs.erneg.2, data=kp_results)
+
+```
+Note: Tertile 1 corresponds to lowest PRS, Tertile 3 corresponds to highest PRS
+
+### FIG. 6D: KM for tertiles of ER- PRS
+```{r, echo=FALSE, fig.align="center", out.width="75%"}
+km_erPRS_3 <- ggsurvplot(km_pc_fit_erneg_tert, data = kp_results, 
+           pval=TRUE, pval.method=T, conf.int=F, title="d",
+           ylim=c(0.80,1), xlim=c(0,12), break.time.by=2, xlab = "Time (years)",
+           pval.coord = c(10, 0.835), pval.method.coord = c(10, 0.85),
+           legend = c(0.15, 0.25), legend.labs=c("Bottom", "Middle", "Top"), legend.title=expression(Tertiles~of~PRS[ER*"-"*"/"*ER*"+"]),
+           risk.table = T, risk.table.height = 0.3, tables.theme=theme_survminer(), risk.table.fontsize=4,
+           ggtheme=theme_classic(), palette=c("#482677FF", "#1F968BFF", "#FDE725FF"),
+           font.x = c(14), font.y = c(14),
+           font.tickslab = c(12))
+
+km_erPRS_3$plot <- km_erPRS_3$plot + theme(plot.title=element_text(hjust=-0.1, face="bold", size=18))
+
+grid.draw.ggsurvplot <- function(x){
+  survminer:::print.ggsurvplot(x, newpage = FALSE)
+}
+
+ggsave(here("output/Fig6d.eps"), plot=km_erPRS_3, dpi=600, width=10, height=7, units="in")
+
+km_erPRS_3
+```
+
+
+### Cox Models
+
+#### Normalize PRS for Cox models
+```{r}
+kp_results <- kp_results %>%
+  mutate(mean = mean(prs.erneg, na.rm=T),
+         sd = sd(prs.erneg, na.rm=T),
+         prs.erneg_norm = (prs.erneg - mean)/sd) %>%
+  select(-c(mean, sd))
+
+er.model.prs205 <- glm(relevel(pw_ER, ref="positive") ~ prs.erneg_norm + PC1+PC2+PC3+PC4+PC5+PC6+PC7+PC8+PC9+PC10, 
+                 family=binomial(link='logit'), data=kp_results)
+```
+
+#### ER Cox model 1: ER- PRS + PCs
+```{r}
+cox.er1 <- coxph(Surv(fu_time, breast_death)~prs.erneg_norm + PC1+PC2+PC3+PC4+PC5+PC6+PC7+PC8+PC9+PC10, data=kp_results)
+summary(cox.er1)
+```
+
+#### ER Cox model 2: ER- PRS + age, BMI, PCs
+```{r}
+cox.er2 <- coxph(Surv(fu_time, breast_death)~prs.erneg_norm + dx_age + BMI_PW + PC1+PC2+PC3+PC4+PC5+PC6+PC7+PC8+PC9+PC10, data=kp_results)
+summary(cox.er2)
+```
+
+#### ER Cox model 3: ER- PRS + age, BMI, PCs, treatment variables
+```{r}
+cox.er3 <- coxph(Surv(fu_time, breast_death) ~ prs.erneg_norm + PC1+PC2+PC3+PC4+PC5+PC6+PC7+PC8+PC9+PC10 + dx_age + BMI_PW +
+                       pw_chemo_yn + pw_herceptin_yn + pw_horm_yn + pw_taxane_yn + pw_rad_yn, data=kp_results)
+summary(cox.er3)
+
+```
+
+
+## **ROR-P PRS versus PRS for ER- vs ER+ disease**
+
+### FIG. S6B: Correlation between ROR-P PRS and PRS for ER- vs ER+ disease
+```{r, echo=FALSE, fig.align="center", out.width="50%", fig.show="hold"}
+
+ggplot(kp_results, aes(x=rorp_prs_norm, y=log(prs.erneg))) + 
+  geom_point() + 
+  geom_smooth(method=lm) +
+  stat_cor(method = "pearson", label.x = 2, label.y = -4) + 
+  theme_classic() +
+  labs(x="ROR-P PRS", y=expression(PRS[ER*"-"*"/"*ER*"+"]))
+
+
+ggsave(plot=last_plot(), filename=here("output/PW_PRS_scatter.png"), bg="white", width=7, height=7)
+
+```
+ 
+#### Joint model 1
+```{r}
+cox.rorp.er1 <- coxph(Surv(fu_time, breast_death) ~ rorp_prs_norm + prs.erneg_norm + PC1+PC2+PC3+PC4+PC5+PC6+PC7+PC8+PC9+PC10, data=kp_results)
+summary(cox.rorp.er1)
+```
+
+#### Joint model 2
+```{r}
+cox.rorp.er2 <- coxph(Surv(fu_time, breast_death) ~ rorp_prs_norm + prs.erneg_norm + dx_age + BMI_PW + PC1+PC2+PC3+PC4+PC5+PC6+PC7+PC8+PC9+PC10, data=kp_results)
+summary(cox.rorp.er2)
+```
+
+#### Joint model 3
+```{r}
+cox.rorp.er3 <- coxph(Surv(fu_time, breast_death) ~ rorp_prs_norm + prs.erneg_norm + dx_age + BMI_PW + 
+                        pw_chemo_yn + pw_herceptin_yn + pw_horm_yn + pw_taxane_yn + pw_rad_yn +
+                        PC1+PC2+PC3+PC4+PC5+PC6+PC7+PC8+PC9+PC10, data=kp_results)
+summary(cox.rorp.er3)
+```
+
+
+## **Recurrence as outcome**
+
+```{r, eval=FALSE, include=FALSE}
+
+kp_results <- kp_results %>% 
+  mutate(fu_yrs_recur = fu_time_recur/365)
+
+km <- with(kp_results, Surv(fu_yrs_recur, recur))
+km_pc_fit_recur <- survfit(Surv(fu_yrs_recur, recur)~prs.tert, data=kp_results)
+
+km_rorpPRS_recur <- ggsurvplot(km_pc_fit_recur, data = kp_results, 
+           pval=TRUE, pval.method=T, conf.int=F,
+           ylim=c(0.80,1), xlim=c(0,12), break.time.by=2, xlab = "Time (years)",
+           pval.coord = c(10, 0.835), pval.method.coord = c(10, 0.85),
+           legend = c(0.15, 0.25), legend.labs=c("Bottom", "Middle", "Top"), legend.title="Tertiles of ROR-P PRS",
+           risk.table = T, risk.table.height = 0.3, tables.theme=theme_survminer(), risk.table.fontsize=4,
+           ggtheme=theme_classic(), palette=c("#482677FF", "#1F968BFF", "#FDE725FF"),
+           font.x = c(14), font.y = c(14),
+           font.tickslab = c(12))
+
+grid.draw.ggsurvplot <- function(x){
+  survminer:::print.ggsurvplot(x, newpage = FALSE)
+}
+
+ggsave(filename=here("output/PW_rorpPRS_recurrence_km.png"), plot=km_rorpPRS_recur, dpi=600, width=10, height=7, units="in")
+#km_rorpPRS_recur
+```
+
+
+### Cox Models
+
+#### Recurrence model 1a
+```{r}
+cox.rorp.recur1 <- coxph(Surv(fu_time_recur, recur) ~ rorp_prs_norm + PC1+PC2+PC3+PC4+PC5+PC6+PC7+PC8+PC9+PC10, data=kp_results)
+summary(cox.rorp.recur1)
+```
+
+#### Recurrence model 1b - Stratified by ER status
+```{r}
+cox.rorp.recur1b <- coxph(Surv(fu_time_recur, recur) ~ rorp_prs_norm + PC1+PC2+PC3+PC4+PC5+PC6+PC7+PC8+PC9+PC10 + strata(pw_ER), data=kp_results)
+summary(cox.rorp.recur1b)
+```
+
+#### Recurrence model 1c - ER-pos only
+```{r}
+cox.rorp.recur1c <- coxph(Surv(fu_time_recur, recur) ~ rorp_prs_norm + PC1+PC2+PC3+PC4+PC5+PC6+PC7+PC8+PC9+PC10, 
+                          data=kp_erpos)
+summary(cox.rorp.recur1c)
+```
+
+#### Recurrence model 1d - ER-neg only
+```{r}
+cox.rorp.recur1d <- coxph(Surv(fu_time_recur, recur) ~ rorp_prs_norm + PC1+PC2+PC3+PC4+PC5+PC6+PC7+PC8+PC9+PC10, 
+                          data=kp_erneg)
+summary(cox.rorp.recur1d)
+```
+
+#### Recurrence model 2
+```{r}
+cox.rorp.recur2 <- coxph(Surv(fu_time_recur, recur) ~ rorp_prs_norm + dx_age + BMI_PW + 
+                           PC1+PC2+PC3+PC4+PC5+PC6+PC7+PC8+PC9+PC10, data=kp_results)
+summary(cox.rorp.recur2)
+```
+
+#### Recurrence model 3
+```{r}
+cox.rorp.recur3 <- coxph(Surv(fu_time_recur, recur) ~ rorp_prs_norm + dx_age + BMI_PW + 
+                           PC1+PC2+PC3+PC4+PC5+PC6+PC7+PC8+PC9+PC10 + pw_ajcc_tnm6, data=kp_results_stage)
+summary(cox.rorp.recur3)
+```
+
+#### Recurrence model 4
+```{r}
+cox.rorp.recur4 <- coxph(Surv(fu_time_recur, recur) ~ rorp_prs_norm + dx_age + BMI_PW + 
+                        pw_chemo_yn + pw_herceptin_yn + pw_horm_yn + pw_taxane_yn + pw_rad_yn +
+                        PC1+PC2+PC3+PC4+PC5+PC6+PC7+PC8+PC9+PC10 + pw_ajcc_tnm6, data=kp_results_stage)
+summary(cox.rorp.recur4)
+```
+
+#### Recurrence model 5
+```{r}
+cox.rorp.recur5 <- coxph(Surv(fu_time_recur, recur) ~ rorp_prs_norm + RORP + PC1+PC2+PC3+PC4+PC5+PC6+PC7+PC8+PC9+PC10, 
+                         data=kp_results_genexp)
+summary(cox.rorp.recur5)
+```
+
+#### Recurrence model 6
+```{r}
+cox.rorp.recur6 <- coxph(Surv(fu_time_recur, recur) ~ rorp_prs_norm + PC1+PC2+PC3+PC4+PC5+PC6+PC7+PC8+PC9+PC10 + pw_ER, data=kp_results)
+summary(cox.rorp.recur6)
+```
+
+
